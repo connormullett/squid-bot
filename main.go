@@ -28,6 +28,11 @@ func main() {
 	cache, _ := lru.New[string, string](12)
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/squid", bot.MatchTypePrefix, makeHandleGetSquid(cache))
+
+	ctx := context.Background()
+
+	log.Println("starting bot")
+	b.Start(ctx)
 }
 
 func makeHandleGetSquid(cache *lru.Cache[string, string]) bot.HandlerFunc {
