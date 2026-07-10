@@ -9,3 +9,4 @@ services:
       - default
     volumes:
       - ${SQUID_DIR}:/app/squid
+      - ./db:/app/db
