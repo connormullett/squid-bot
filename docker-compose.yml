@@ -2,6 +2,7 @@ services:
   squid-bot:
     build:
       context: .
+    container_name: squid-bot
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
     networks:
