@@ -1,9 +1,7 @@
 services:
-  goose-data-service:
+  squid-bot:
     build:
       context: .
-      dockerfile: data_service/Dockerfile
-    container_name: goose-data-service
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
     networks:
