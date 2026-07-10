@@ -32,7 +32,7 @@ func main() {
 
 func makeHandleGetSquid(cache *lru.Cache[string, string]) bot.HandlerFunc {
 	return func(c context.Context, b *bot.Bot, update *models.Update) {
-		file, err := getRandomFile(cache, os.Getenv("SQUID_DIR"))
+		file, err := getRandomFile(cache, "/app/squid")
 		if err != nil {
 			log.Println(err)
 			return

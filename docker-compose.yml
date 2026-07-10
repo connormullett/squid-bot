@@ -1,0 +1,12 @@
+services:
+  goose-data-service:
+    build:
+      context: .
+      dockerfile: data_service/Dockerfile
+    container_name: goose-data-service
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+    networks:
+      - default
+    volumes:
+      - ${SQUID_DIR}:/app/squid
