@@ -82,7 +82,7 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.Handle
 			err = handleListMyTags(c, b, update, db)
 		} else if len(commandParts) == 2 {
 			// get squid with tag
-			err = handleGetSquidWithTag(c, b, update, cache, db, commandParts[1])
+			err = handleGetSquidWithTag(c, b, update, db, commandParts[1])
 		} else if len(commandParts) == 3 && commandParts[1] == "add" {
 			// add squid with tag
 			err = handleAddTag(c, b, update, cache, db, commandParts[2])
@@ -99,7 +99,7 @@ type TagQuery struct {
 	Name string
 }
 
-func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, tag string) error {
+func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
 	// check if tag exists
 	tagsQuery := "SELECT id, name FROM tags WHERE name = ?"
 	tagsStmt, err := db.Prepare(tagsQuery)
