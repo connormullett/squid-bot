@@ -58,20 +58,42 @@ func main() {
 
 	cache, _ := lru.New[string, string](12)
 
-	b.RegisterHandler(bot.HandlerTypeMessageText, "squid", bot.MatchTypeCommandStartOnly, makeHandleGetSquid(cache, db))
-
 	ctx := context.Background()
+
+	me, err := b.GetMe(ctx)
+	if err != nil {
+		log.Fatalf("Failed to get bot info: %s", err.Error())
+	}
+
+	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(cache, db))
 
 	log.Println("starting bot")
 	b.Start(ctx)
 }
 
+func matchCommand(command, botUsername string) bot.MatchFunc {
+	return func(update *models.Update) bool {
+		if update.Message == nil {
+			return false
+		}
+		for _, e := range update.Message.Entities {
+			if e.Type != models.MessageEntityTypeBotCommand || e.Offset != 0 {
+				continue
+			}
+			name, mention, _ := strings.Cut(update.Message.Text[1:e.Length], "@")
+			return name == command && (mention == "" || strings.EqualFold(mention, botUsername))
+		}
+		return false
+	}
+}
+
 func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.HandlerFunc {
 	return func(c context.Context, b *bot.Bot, update *models.Update) {
 		commandParts := strings.Split(update.Message.Text, " ")
+		command := strings.Split(commandParts[0], "@")[0]
 
 		var err error
-		if len(commandParts) == 1 && strings.HasPrefix(commandParts[0], "/squid") {
+		if len(commandParts) == 1 && command == "/squid" {
 			// just get squid
 			err = handleGetSquid(c, b, update, cache, db)
 		} else if len(commandParts) == 2 && commandParts[1] == "tags" {
