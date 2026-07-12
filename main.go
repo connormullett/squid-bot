@@ -58,7 +58,7 @@ func main() {
 
 	cache, _ := lru.New[string, string](12)
 
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/squid", bot.MatchTypePrefix, makeHandleGetSquid(cache, db))
+	b.RegisterHandler(bot.HandlerTypeMessageText, "squid", bot.MatchTypeCommandStartOnly, makeHandleGetSquid(cache, db))
 
 	ctx := context.Background()
 
@@ -74,6 +74,12 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.Handle
 		if len(commandParts) == 1 && strings.HasPrefix(commandParts[0], "/squid") {
 			// just get squid
 			err = handleGetSquid(c, b, update, cache, db)
+		} else if len(commandParts) == 2 && commandParts[1] == "tags" {
+			// list all tags
+			err = handleListTags(c, b, update, db)
+		} else if len(commandParts) == 2 && commandParts[1] == "mytags" {
+			// list tags created by user
+			err = handleListMyTags(c, b, update, db)
 		} else if len(commandParts) == 2 {
 			// get squid with tag
 			err = handleGetSquidWithTag(c, b, update, cache, db, commandParts[1])
@@ -136,14 +142,109 @@ func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update,
 		return fmt.Errorf("failed to query images: %s", err.Error())
 	}
 
+	caption, err := tagsCaption(db, imageName)
+	if err != nil {
+		return err
+	}
+
 	if _, err := b.SendPhoto(c, &bot.SendPhotoParams{
-		ChatID: update.Message.Chat.ID,
-		Photo:  &models.InputFileString{Data: imageName},
+		ChatID:  update.Message.Chat.ID,
+		Photo:   &models.InputFileString{Data: imageName},
+		Caption: caption,
 	}); err != nil {
 		return fmt.Errorf("failed to send photo: %s", err.Error())
 	}
 
 	return nil
+}
+
+// tagsCaption returns all tags associated with an image as comma separated
+// values, or "" if the image has no tags.
+func tagsCaption(db *sql.DB, fileName string) (string, error) {
+	rows, err := db.Query(
+		"SELECT DISTINCT t.name FROM tags t JOIN tag_images ti ON ti.tag_id = t.id WHERE ti.file_name = ?",
+		fileName,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to query tags for image: %s", err.Error())
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return "", fmt.Errorf("failed to scan tag name: %s", err.Error())
+		}
+		tags = append(tags, name)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("failed to read tags for image: %s", err.Error())
+	}
+
+	return strings.Join(tags, ", "), nil
+}
+
+func handleListTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB) error {
+	tags, err := queryTagNames(db, "SELECT name FROM tags ORDER BY name")
+	if err != nil {
+		return err
+	}
+
+	text := "no tags yet"
+	if len(tags) > 0 {
+		text = strings.Join(tags, ", ")
+	}
+
+	b.SendMessage(c, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   text,
+	})
+	return nil
+}
+
+func handleListMyTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB) error {
+	if update.Message.From == nil {
+		return errors.New("mytags: message has no sender")
+	}
+
+	tags, err := queryTagNames(db, "SELECT name FROM tags WHERE created_by = ? ORDER BY name", update.Message.From.ID)
+	if err != nil {
+		return err
+	}
+
+	text := "you have not created any tags"
+	if len(tags) > 0 {
+		text = strings.Join(tags, ", ")
+	}
+
+	b.SendMessage(c, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   text,
+	})
+	return nil
+}
+
+func queryTagNames(db *sql.DB, query string, args ...any) ([]string, error) {
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tags: %s", err.Error())
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("failed to scan tag name: %s", err.Error())
+		}
+		tags = append(tags, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read tags: %s", err.Error())
+	}
+
+	return tags, nil
 }
 
 const maxTagsPerUser = 100
@@ -191,21 +292,31 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, cache *l
 			return fmt.Errorf("add tag: user %d reached tag limit", senderID)
 		}
 
-		res, err := db.Exec("INSERT INTO tags (name, created_by) VALUES (?, ?)", tag, senderID)
-		if err != nil {
+		if _, err := db.Exec("INSERT INTO tags (name, created_by) VALUES (?, ?) ON CONFLICT(name) DO NOTHING", tag, senderID); err != nil {
 			return fmt.Errorf("failed to create tag: %s", err.Error())
 		}
-		tagID, err = res.LastInsertId()
-		if err != nil {
+		if err := db.QueryRow("SELECT id FROM tags WHERE name = ?", tag).Scan(&tagID); err != nil {
 			return fmt.Errorf("failed to get created tag id: %s", err.Error())
 		}
 	case err != nil:
 		return fmt.Errorf("failed to query tags: %s", err.Error())
 	}
 
-	// associate the replied-to image with the tag
-	if _, err := db.Exec("INSERT INTO tag_images (tag_id, file_name) VALUES (?, ?)", tagID, fileName); err != nil {
+	// associate the replied-to image with the tag, ignoring duplicates
+	res, err := db.Exec("INSERT INTO tag_images (tag_id, file_name) VALUES (?, ?) ON CONFLICT(tag_id, file_name) DO NOTHING", tagID, fileName)
+	if err != nil {
 		return fmt.Errorf("failed to add tag image: %s", err.Error())
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check tag image insert: %s", err.Error())
+	}
+	if inserted == 0 {
+		b.SendMessage(c, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   fmt.Sprintf("image already has tag %s", tag),
+		})
+		return nil
 	}
 
 	b.SendMessage(c, &bot.SendMessageParams{
@@ -236,14 +347,19 @@ func handleGetSquid(c context.Context, b *bot.Bot, update *models.Update, cache 
 		return errors.New("no files found")
 	}
 
-	if err := sendPhoto(c, b, update, file); err != nil {
+	if err := sendPhoto(c, b, update, db, file); err != nil {
 		return fmt.Errorf("failed to send photo: %s", err.Error())
 	}
 	return nil
 }
 
-func sendPhoto(c context.Context, b *bot.Bot, update *models.Update, file string) error {
+func sendPhoto(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, file string) error {
 	photoContent, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+
+	caption, err := tagsCaption(db, filepath.Base(file))
 	if err != nil {
 		return err
 	}
@@ -254,6 +370,7 @@ func sendPhoto(c context.Context, b *bot.Bot, update *models.Update, file string
 			Filename: filepath.Base(file),
 			Data:     bytes.NewReader(photoContent),
 		},
+		Caption: caption,
 	})
 
 	return err
