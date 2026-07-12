@@ -50,7 +50,7 @@ func main() {
 		log.Fatalf("Failed to create tag_images table: %s", err.Error())
 	}
 
-	b, err := bot.New(os.Getenv("BOT_TOKEN"), bot.WithDebug())
+	b, err := bot.New(os.Getenv("BOT_TOKEN"))
 	if err != nil {
 		log.Fatalf("Failed to create bot: %s", err.Error())
 	}
