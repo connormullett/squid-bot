@@ -50,7 +50,7 @@ func main() {
 		log.Fatalf("Failed to create tag_images table: %s", err.Error())
 	}
 
-	b, err := bot.New(os.Getenv("BOT_TOKEN"))
+	b, err := bot.New(os.Getenv("BOT_TOKEN"), bot.WithDebug())
 	if err != nil {
 		log.Fatalf("Failed to create bot: %s", err.Error())
 	}
@@ -85,7 +85,7 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.Handle
 			err = handleGetSquidWithTag(c, b, update, db, commandParts[1])
 		} else if len(commandParts) == 3 && commandParts[1] == "add" {
 			// add squid with tag
-			err = handleAddTag(c, b, update, cache, db, commandParts[2])
+			err = handleAddTag(c, b, update, db, commandParts[2])
 		}
 
 		if err != nil {
@@ -249,7 +249,7 @@ func queryTagNames(db *sql.DB, query string, args ...any) ([]string, error) {
 
 const maxTagsPerUser = 100
 
-func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, tag string) error {
+func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
 	// the image to associate with the tag comes from the replied-to message
 	if update.Message.ReplyToMessage == nil {
 		b.SendMessage(c, &bot.SendMessageParams{
@@ -257,6 +257,15 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, cache *l
 			Text:   "reply to an image to add a tag",
 		})
 		return fmt.Errorf("add tag: no replied-to message")
+	}
+
+	// only images sent by the bot itself can be tagged
+	if update.Message.ReplyToMessage.From == nil || update.Message.ReplyToMessage.From.ID != b.ID() {
+		b.SendMessage(c, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   "only images sent by squid-bot can be tagged",
+		})
+		return nil
 	}
 
 	fileName := replyImageFileID(update.Message.ReplyToMessage)
