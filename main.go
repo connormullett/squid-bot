@@ -66,6 +66,15 @@ func main() {
 	}
 
 	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(cache, db))
+	b.RegisterHandlerMatchFunc(matchCommand("help", me.Username), func(c context.Context, b *bot.Bot, update *models.Update) {
+		sendText(c, b, update, `Commands:
+/squid - get a random squid image
+/squid <tag> [tag...] - get a random squid image having all the specified tags
+/squid tags - list all tags
+/squid tagsinfo <tag> - get info about the specified tag
+/squid mytags - list your created tags
+/squid add <tag> [tag...] - add the replied-to image to the specified tag(s)`)
+	})
 
 	log.Println("starting bot")
 	b.Start(ctx)
@@ -89,77 +98,113 @@ func matchCommand(command, botUsername string) bot.MatchFunc {
 
 func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.HandlerFunc {
 	return func(c context.Context, b *bot.Bot, update *models.Update) {
-		commandParts := strings.Split(update.Message.Text, " ")
-		command := strings.Split(commandParts[0], "@")[0]
+		// matchCommand guarantees the message starts with /squid[@botname];
+		// everything after it is arguments
+		args := strings.Fields(update.Message.Text)[1:]
+
+		var sub string
+		if len(args) > 0 {
+			sub = args[0]
+		}
 
 		var err error
-		if len(commandParts) == 1 && command == "/squid" {
+		switch {
+		case len(args) == 0:
 			// just get squid
 			err = handleGetSquid(c, b, update, cache, db)
-		} else if len(commandParts) == 2 && commandParts[1] == "tags" {
+		case sub == "tags" && len(args) == 1:
 			// list all tags
 			err = handleListTags(c, b, update, db)
-		} else if len(commandParts) == 2 && commandParts[1] == "mytags" {
+		case sub == "mytags" && len(args) == 1:
 			// list tags created by user
 			err = handleListMyTags(c, b, update, db)
-		} else if len(commandParts) == 2 {
-			// get squid with tag
-			err = handleGetSquidWithTag(c, b, update, db, commandParts[1])
-		} else if len(commandParts) == 3 && commandParts[1] == "add" {
-			// add squid with tag
-			err = handleAddTag(c, b, update, db, commandParts[2])
+		case sub == "tagsinfo" && len(args) == 2:
+			// get info about a tag
+			err = handleTagInfo(c, b, update, db, args[1])
+		case sub == "add" && len(args) >= 2:
+			// add the replied-to image to one or more tags
+			err = handleAddTag(c, b, update, db, args[1:]...)
+		default:
+			// get squid matching all given tags
+			err = handleGetSquidWithTag(c, b, update, db, args...)
 		}
 
 		if err != nil {
+			sendText(c, b, update, "Something went wrong D:\n"+err.Error())
 			log.Println(err)
 		}
 	}
 }
 
-type TagQuery struct {
-	ID   int
-	Name string
+func handleTagInfo(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
+	tagsQuery := "SELECT COUNT(*) FROM tag_images WHERE id IN (SELECT id FROM tags WHERE name = ?)"
+	var count int
+	err := db.QueryRow(tagsQuery, tag).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("failed to query tag info: %s", err.Error())
+	}
+
+	sendText(c, b, update, fmt.Sprintf("tag %s has %d images", tag, count))
+	return nil
 }
 
-func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
-	// check if tag exists
-	tagsQuery := "SELECT id, name FROM tags WHERE name = ?"
-	tagsStmt, err := db.Prepare(tagsQuery)
-	if err != nil {
-		return fmt.Errorf("failed to prepare tags query: %s", err.Error())
-	}
-	defer tagsStmt.Close()
-
-	var foundTag TagQuery
-	err = tagsStmt.QueryRow(tag).Scan(&foundTag.ID, &foundTag.Name)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			b.SendMessage(c, &bot.SendMessageParams{
-				ChatID: update.Message.Chat.ID,
-				Text:   fmt.Sprintf("failed to find tag %s", tag),
-			})
-			return fmt.Errorf("tag %s not found", tag)
+func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tags ...string) error {
+	// dedupe tags, preserving order
+	seen := make(map[string]bool, len(tags))
+	uniqueTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if !seen[tag] {
+			seen[tag] = true
+			uniqueTags = append(uniqueTags, tag)
 		}
-		return fmt.Errorf("failed to query tags: %s", err.Error())
+	}
+	tags = uniqueTags
+
+	if len(tags) > 10 {
+		sendText(c, b, update, "too many tags, limit 10")
+		return nil
 	}
 
-	// get image by tag
-	imageQuery := "SELECT file_name FROM tag_images WHERE tag_id = ? ORDER BY RANDOM() LIMIT 1"
-	imageStmt, err := db.Prepare(imageQuery)
-	if err != nil {
-		return fmt.Errorf("failed to prepare image query: %s", err.Error())
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",")
+	tagArgs := make([]any, len(tags))
+	for i, tag := range tags {
+		tagArgs[i] = tag
 	}
-	defer imageStmt.Close()
+
+	// check that all tags exist
+	found, err := queryTagNames(db, "SELECT name FROM tags WHERE name IN ("+placeholders+")", tagArgs...)
+	if err != nil {
+		return err
+	}
+	if len(found) != len(tags) {
+		foundSet := make(map[string]bool, len(found))
+		for _, name := range found {
+			foundSet[name] = true
+		}
+		var missing []string
+		for _, tag := range tags {
+			if !foundSet[tag] {
+				missing = append(missing, tag)
+			}
+		}
+		sendText(c, b, update, fmt.Sprintf("failed to find tag(s) %s", strings.Join(missing, ", ")))
+		return nil
+	}
+
+	// pick a random image that has every requested tag
+	imageQuery := `SELECT ti.file_name FROM tag_images ti
+		JOIN tags t ON ti.tag_id = t.id
+		WHERE t.name IN (` + placeholders + `)
+		GROUP BY ti.file_name
+		HAVING COUNT(DISTINCT t.id) = ?
+		ORDER BY RANDOM() LIMIT 1`
 
 	var imageName string
-	err = imageStmt.QueryRow(foundTag.ID).Scan(&imageName)
+	err = db.QueryRow(imageQuery, append(tagArgs, len(tags))...).Scan(&imageName)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			b.SendMessage(c, &bot.SendMessageParams{
-				ChatID: update.Message.Chat.ID,
-				Text:   fmt.Sprintf("no images found for tag %s", tag),
-			})
-			return fmt.Errorf("no images found for tag %s", tag)
+			sendText(c, b, update, fmt.Sprintf("no images found for tag(s) %s", strings.Join(tags, ", ")))
+			return nil
 		}
 		return fmt.Errorf("failed to query images: %s", err.Error())
 	}
@@ -218,10 +263,7 @@ func handleListTags(c context.Context, b *bot.Bot, update *models.Update, db *sq
 		text = strings.Join(tags, ", ")
 	}
 
-	b.SendMessage(c, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   text,
-	})
+	sendText(c, b, update, text)
 	return nil
 }
 
@@ -240,10 +282,7 @@ func handleListMyTags(c context.Context, b *bot.Bot, update *models.Update, db *
 		text = strings.Join(tags, ", ")
 	}
 
-	b.SendMessage(c, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   text,
-	})
+	sendText(c, b, update, text)
 	return nil
 }
 
@@ -271,32 +310,33 @@ func queryTagNames(db *sql.DB, query string, args ...any) ([]string, error) {
 
 const maxTagsPerUser = 100
 
-func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
+func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tags ...string) error {
 	// the image to associate with the tag comes from the replied-to message
 	if update.Message.ReplyToMessage == nil {
-		b.SendMessage(c, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   "reply to an image to add a tag",
-		})
-		return fmt.Errorf("add tag: no replied-to message")
+		sendText(c, b, update, "reply to an image to add a tag")
+		return nil
 	}
 
-	// only images sent by the bot itself can be tagged
-	if update.Message.ReplyToMessage.From == nil || update.Message.ReplyToMessage.From.ID != b.ID() {
-		b.SendMessage(c, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   "only images sent by squid-bot can be tagged",
-		})
+	// only images sent by the bot itself, directly or forwarded, can be tagged
+	if !sentBySquidBot(update.Message.ReplyToMessage, b.ID()) {
+		sendText(c, b, update, "only images sent by squid-bot can be tagged")
 		return nil
 	}
 
 	fileName := replyImageFileID(update.Message.ReplyToMessage)
 	if fileName == "" {
-		b.SendMessage(c, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   "the replied-to message does not contain an image",
-		})
-		return errors.New("add tag: replied-to message has no image")
+		sendText(c, b, update, "the replied-to message does not contain an image")
+		return nil
+	}
+
+	if len(tags) == 0 {
+		sendText(c, b, update, "no tags given")
+		return nil
+	}
+
+	if len(tags) > 10 {
+		sendText(c, b, update, "too many tags, limit 10")
+		return nil
 	}
 
 	if update.Message.From == nil {
@@ -304,58 +344,116 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.
 	}
 	senderID := update.Message.From.ID
 
-	// check if the tag already exists
-	var tagID int64
-	err := db.QueryRow("SELECT id FROM tags WHERE name = ?", tag).Scan(&tagID)
-	switch {
-	case err == sql.ErrNoRows:
-		// tag doesn't exist yet, create it only if the sender is under
-		// their tag creation limit
-		var tagCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM tags WHERE created_by = ?", senderID).Scan(&tagCount); err != nil {
-			return fmt.Errorf("failed to count tags for user: %s", err.Error())
+	// dedupe tags, preserving order
+	seen := make(map[string]bool, len(tags))
+	uniqueTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if !seen[tag] {
+			seen[tag] = true
+			uniqueTags = append(uniqueTags, tag)
 		}
-		if tagCount >= maxTagsPerUser {
-			b.SendMessage(c, &bot.SendMessageParams{
-				ChatID: update.Message.Chat.ID,
-				Text:   fmt.Sprintf("you have reached the limit of %d tags", maxTagsPerUser),
-			})
-			return fmt.Errorf("add tag: user %d reached tag limit", senderID)
-		}
+	}
+	tags = uniqueTags
 
-		if _, err := db.Exec("INSERT INTO tags (name, created_by) VALUES (?, ?) ON CONFLICT(name) DO NOTHING", tag, senderID); err != nil {
-			return fmt.Errorf("failed to create tag: %s", err.Error())
-		}
-		if err := db.QueryRow("SELECT id FROM tags WHERE name = ?", tag).Scan(&tagID); err != nil {
-			return fmt.Errorf("failed to get created tag id: %s", err.Error())
-		}
-	case err != nil:
-		return fmt.Errorf("failed to query tags: %s", err.Error())
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",")
+	tagArgs := make([]any, len(tags))
+	for i, tag := range tags {
+		tagArgs[i] = tag
 	}
 
-	// associate the replied-to image with the tag, ignoring duplicates
-	res, err := db.Exec("INSERT INTO tag_images (tag_id, file_name) VALUES (?, ?) ON CONFLICT(tag_id, file_name) DO NOTHING", tagID, fileName)
+	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("failed to add tag image: %s", err.Error())
+		return fmt.Errorf("failed to begin transaction: %s", err.Error())
+	}
+	defer tx.Rollback()
+
+	// find which tags need to be created
+	existing := make(map[string]bool, len(tags))
+	rows, err := tx.Query("SELECT name FROM tags WHERE name IN ("+placeholders+")", tagArgs...)
+	if err != nil {
+		return fmt.Errorf("failed to query tags: %s", err.Error())
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan tag name: %s", err.Error())
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to read tags: %s", err.Error())
+	}
+	rows.Close()
+
+	var newTags []string
+	for _, tag := range tags {
+		if !existing[tag] {
+			newTags = append(newTags, tag)
+		}
+	}
+
+	if len(newTags) > 0 {
+		// creating tags is only allowed while the sender is under their
+		// tag creation limit
+		var tagCount int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM tags WHERE created_by = ?", senderID).Scan(&tagCount); err != nil {
+			return fmt.Errorf("failed to count tags for user: %s", err.Error())
+		}
+		if tagCount+len(newTags) > maxTagsPerUser {
+			sendText(c, b, update, fmt.Sprintf("you have reached the limit of %d tags", maxTagsPerUser))
+			return nil
+		}
+
+		insertValues := strings.TrimSuffix(strings.Repeat("(?, ?),", len(newTags)), ",")
+		insertArgs := make([]any, 0, len(newTags)*2)
+		for _, tag := range newTags {
+			insertArgs = append(insertArgs, tag, senderID)
+		}
+		if _, err := tx.Exec("INSERT INTO tags (name, created_by) VALUES "+insertValues+" ON CONFLICT(name) DO NOTHING", insertArgs...); err != nil {
+			return fmt.Errorf("failed to create tags: %s", err.Error())
+		}
+	}
+
+	// associate the image with every tag in one insert, ignoring duplicates
+	res, err := tx.Exec(
+		"INSERT INTO tag_images (tag_id, file_name) SELECT id, ? FROM tags WHERE name IN ("+placeholders+") ON CONFLICT(tag_id, file_name) DO NOTHING",
+		append([]any{fileName}, tagArgs...)...,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to add tag images: %s", err.Error())
 	}
 	inserted, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to check tag image insert: %s", err.Error())
 	}
-	if inserted == 0 {
-		b.SendMessage(c, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   fmt.Sprintf("image already has tag %s", tag),
-		})
-		return nil
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %s", err.Error())
 	}
 
-	b.SendMessage(c, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   fmt.Sprintf("added image to tag %s", tag),
-	})
+	text := fmt.Sprintf("added image to tag(s) %s", strings.Join(tags, ", "))
+	if inserted == 0 {
+		text = fmt.Sprintf("image already has tag(s) %s", strings.Join(tags, ", "))
+	}
+	sendText(c, b, update, text)
 
 	return nil
+}
+
+// sentBySquidBot reports whether the message was sent by the bot itself,
+// either directly or forwarded from it by another user.
+func sentBySquidBot(msg *models.Message, botID int64) bool {
+	if msg.From != nil && msg.From.ID == botID {
+		return true
+	}
+	if msg.ForwardOrigin != nil &&
+		msg.ForwardOrigin.Type == models.MessageOriginTypeUser &&
+		msg.ForwardOrigin.MessageOriginUser != nil {
+		return msg.ForwardOrigin.MessageOriginUser.SenderUser.ID == botID
+	}
+	return false
 }
 
 func replyImageFileID(msg *models.Message) string {
@@ -377,20 +475,7 @@ func handleGetSquid(c context.Context, b *bot.Bot, update *models.Update, cache 
 	if file == "" {
 		return errors.New("no files found")
 	}
-
-	if err := sendPhoto(c, b, update, db, file); err != nil {
-		return fmt.Errorf("failed to send photo: %s", err.Error())
-	}
-	return nil
-}
-
-func sendPhoto(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, file string) error {
 	photoContent, err := os.ReadFile(file)
-	if err != nil {
-		return err
-	}
-
-	caption, err := tagsCaption(db, filepath.Base(file))
 	if err != nil {
 		return err
 	}
@@ -401,9 +486,16 @@ func sendPhoto(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB,
 			Filename: filepath.Base(file),
 			Data:     bytes.NewReader(photoContent),
 		},
-		Caption: caption,
 	})
 
+	return err
+}
+
+func sendText(c context.Context, b *bot.Bot, update *models.Update, text string) error {
+	_, err := b.SendMessage(c, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   text,
+	})
 	return err
 }
 
