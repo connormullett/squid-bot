@@ -137,7 +137,7 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.Handle
 }
 
 func handleTagInfo(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
-	tagsQuery := "SELECT COUNT(*) FROM tag_images WHERE id IN (SELECT id FROM tags WHERE name = ?)"
+	tagsQuery := "SELECT COUNT(*) FROM tag_images ti JOIN tags t ON ti.tag_id = t.id WHERE t.name = ?"
 	var count int
 	err := db.QueryRow(tagsQuery, tag).Scan(&count)
 	if err != nil {
