@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -50,6 +51,24 @@ func main() {
 		log.Fatalf("Failed to create tag_images table: %s", err.Error())
 	}
 
+	createTagLimitsTable := `CREATE TABLE IF NOT EXISTS tag_limits (
+		user_id INTEGER PRIMARY KEY,
+		tag_limit INTEGER NOT NULL DEFAULT 100
+	)`
+	if _, err := db.Exec(createTagLimitsTable); err != nil {
+		log.Fatalf("Failed to create tag_limits table: %s", err.Error())
+	}
+
+	var adminID int64
+	if raw := os.Getenv("ADMIN_ID"); raw != "" {
+		adminID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			log.Fatalf("Invalid ADMIN_ID: %s", err.Error())
+		}
+	} else {
+		log.Println("warning: ADMIN_ID not set, bumptags command is disabled")
+	}
+
 	b, err := bot.New(os.Getenv("BOT_TOKEN"))
 	if err != nil {
 		log.Fatalf("Failed to create bot: %s", err.Error())
@@ -65,7 +84,7 @@ func main() {
 		log.Fatalf("Failed to get bot info: %s", err.Error())
 	}
 
-	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(cache, db))
+	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(cache, db, adminID))
 	b.RegisterHandlerMatchFunc(matchCommand("help", me.Username), func(c context.Context, b *bot.Bot, update *models.Update) {
 		sendText(c, b, update, `Commands:
 /squid - get a random squid image
@@ -73,7 +92,8 @@ func main() {
 /squid tags - list all tags
 /squid tagsinfo <tag> - get info about the specified tag
 /squid mytags - list your created tags
-/squid add <tag> [tag...] - add the replied-to image to the specified tag(s)`)
+/squid add <tag> [tag...] - add the replied-to image to the specified tag(s)
+/squid bumptags <n> - (admin) reply to a user's message to raise their tag limit by n`)
 	})
 
 	log.Println("starting bot")
@@ -96,10 +116,8 @@ func matchCommand(command, botUsername string) bot.MatchFunc {
 	}
 }
 
-func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.HandlerFunc {
+func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB, adminID int64) bot.HandlerFunc {
 	return func(c context.Context, b *bot.Bot, update *models.Update) {
-		// matchCommand guarantees the message starts with /squid[@botname];
-		// everything after it is arguments
 		args := strings.Fields(update.Message.Text)[1:]
 
 		var sub string
@@ -124,6 +142,9 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB) bot.Handle
 		case sub == "add" && len(args) >= 2:
 			// add the replied-to image to one or more tags
 			err = handleAddTag(c, b, update, db, args[1:]...)
+		case sub == "bumptags" && len(args) == 2:
+			// (admin) raise the replied-to user's tag creation limit
+			err = handleBumpTags(c, b, update, db, adminID, args[1])
 		default:
 			// get squid matching all given tags
 			err = handleGetSquidWithTag(c, b, update, db, args...)
@@ -225,8 +246,6 @@ func handleGetSquidWithTag(c context.Context, b *bot.Bot, update *models.Update,
 	return nil
 }
 
-// tagsCaption returns all tags associated with an image as comma separated
-// values, or "" if the image has no tags.
 func tagsCaption(db *sql.DB, fileName string) (string, error) {
 	rows, err := db.Query(
 		"SELECT DISTINCT t.name FROM tags t JOIN tag_images ti ON ti.tag_id = t.id WHERE ti.file_name = ?",
@@ -253,6 +272,25 @@ func tagsCaption(db *sql.DB, fileName string) (string, error) {
 }
 
 func handleListTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB) error {
+	// if replying to a squid-bot image, list that image's tags instead of all tags
+	if reply := update.Message.ReplyToMessage; reply != nil && sentBySquidBot(reply, b.ID()) {
+		fileName := replyImageFileID(reply)
+		if fileName == "" {
+			sendText(c, b, update, "the replied-to message does not contain an image")
+			return nil
+		}
+
+		caption, err := tagsCaption(db, fileName)
+		if err != nil {
+			return err
+		}
+		if caption == "" {
+			caption = "this image has no tags"
+		}
+		sendText(c, b, update, caption)
+		return nil
+	}
+
 	tags, err := queryTagNames(db, "SELECT name FROM tags ORDER BY name")
 	if err != nil {
 		return err
@@ -308,16 +346,85 @@ func queryTagNames(db *sql.DB, query string, args ...any) ([]string, error) {
 	return tags, nil
 }
 
-const maxTagsPerUser = 100
+const defaultTagLimit = 100
+
+// rowQuerier is satisfied by both *sql.DB and *sql.Tx.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func tagLimit(q rowQuerier, userID int64) (int, error) {
+	var limit int
+	err := q.QueryRow("SELECT tag_limit FROM tag_limits WHERE user_id = ?", userID).Scan(&limit)
+	if err == sql.ErrNoRows {
+		return defaultTagLimit, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to query tag limit: %s", err.Error())
+	}
+	return limit, nil
+}
+
+func handleBumpTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, adminID int64, amountArg string) error {
+	if update.Message.From == nil || adminID == 0 || update.Message.From.ID != adminID {
+		sendText(c, b, update, "only @surgethewolf can use this command")
+		return nil
+	}
+
+	if update.Message.ReplyToMessage == nil {
+		sendText(c, b, update, "reply to a message from the user whose limit you want to bump")
+		return nil
+	}
+	if update.Message.ReplyToMessage.From == nil {
+		sendText(c, b, update, "the replied-to message has no sender")
+		return nil
+	}
+	targetID := update.Message.ReplyToMessage.From.ID
+
+	amount, err := strconv.Atoi(amountArg)
+	if err != nil || amount <= 0 {
+		sendText(c, b, update, "amount must be a positive integer")
+		return nil
+	}
+
+	// start from the default limit for users who have no row yet, then add.
+	if _, err := db.Exec(
+		`INSERT INTO tag_limits (user_id, tag_limit) VALUES (?, ?)
+			ON CONFLICT(user_id) DO UPDATE SET tag_limit = tag_limit + ?`,
+		targetID, defaultTagLimit+amount, amount,
+	); err != nil {
+		return fmt.Errorf("failed to bump tag limit: %s", err.Error())
+	}
+
+	newLimit, err := tagLimit(db, targetID)
+	if err != nil {
+		return err
+	}
+
+	sendText(c, b, update, fmt.Sprintf("bumped tag limit for %s by %d, now %d", replyToSenderName(update.Message.ReplyToMessage), amount, newLimit))
+	return nil
+}
+
+func replyToSenderName(msg *models.Message) string {
+	if msg.From == nil {
+		return "user"
+	}
+	if msg.From.Username != "" {
+		return "@" + msg.From.Username
+	}
+	name := strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
+	if name == "" {
+		return fmt.Sprintf("user %d", msg.From.ID)
+	}
+	return name
+}
 
 func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tags ...string) error {
-	// the image to associate with the tag comes from the replied-to message
 	if update.Message.ReplyToMessage == nil {
 		sendText(c, b, update, "reply to an image to add a tag")
 		return nil
 	}
 
-	// only images sent by the bot itself, directly or forwarded, can be tagged
 	if !sentBySquidBot(update.Message.ReplyToMessage, b.ID()) {
 		sendText(c, b, update, "only images sent by squid-bot can be tagged")
 		return nil
@@ -395,14 +502,17 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.
 	}
 
 	if len(newTags) > 0 {
-		// creating tags is only allowed while the sender is under their
-		// tag creation limit
+		// creating tags is only allowed while the sender is under their tag creation limit
 		var tagCount int
 		if err := tx.QueryRow("SELECT COUNT(*) FROM tags WHERE created_by = ?", senderID).Scan(&tagCount); err != nil {
 			return fmt.Errorf("failed to count tags for user: %s", err.Error())
 		}
-		if tagCount+len(newTags) > maxTagsPerUser {
-			sendText(c, b, update, fmt.Sprintf("you have reached the limit of %d tags", maxTagsPerUser))
+		limit, err := tagLimit(tx, senderID)
+		if err != nil {
+			return err
+		}
+		if tagCount+len(newTags) > limit {
+			sendText(c, b, update, fmt.Sprintf("you have reached the limit of %d tags", limit))
 			return nil
 		}
 
@@ -416,7 +526,7 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.
 		}
 	}
 
-	// associate the image with every tag in one insert, ignoring duplicates
+	// associate the image with every tag
 	res, err := tx.Exec(
 		"INSERT INTO tag_images (tag_id, file_name) SELECT id, ? FROM tags WHERE name IN ("+placeholders+") ON CONFLICT(tag_id, file_name) DO NOTHING",
 		append([]any{fileName}, tagArgs...)...,
@@ -442,8 +552,6 @@ func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.
 	return nil
 }
 
-// sentBySquidBot reports whether the message was sent by the bot itself,
-// either directly or forwarded from it by another user.
 func sentBySquidBot(msg *models.Message, botID int64) bool {
 	if msg.From != nil && msg.From.ID == botID {
 		return true
@@ -461,7 +569,6 @@ func replyImageFileID(msg *models.Message) string {
 		return msg.Document.FileID
 	}
 	if len(msg.Photo) > 0 {
-		// the last PhotoSize is the largest resolution
 		return msg.Photo[len(msg.Photo)-1].FileID
 	}
 	return ""

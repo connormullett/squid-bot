@@ -5,6 +5,7 @@ services:
     container_name: squid-bot
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_ID: ${ADMIN_ID}
     networks:
       - default
     volumes:
