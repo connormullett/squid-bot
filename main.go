@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,14 +61,8 @@ func main() {
 		log.Fatalf("Failed to create tag_limits table: %s", err.Error())
 	}
 
-	var adminID int64
-	if raw := os.Getenv("ADMIN_ID"); raw != "" {
-		adminID, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			log.Fatalf("Invalid ADMIN_ID: %s", err.Error())
-		}
-	} else {
-		log.Println("warning: ADMIN_ID not set, bumptags command is disabled")
+	if os.Getenv("ADMIN_ID") == "" {
+		log.Fatal("ADMIN_ID environment variable is not set")
 	}
 
 	b, err := bot.New(os.Getenv("BOT_TOKEN"))
@@ -84,7 +80,22 @@ func main() {
 		log.Fatalf("Failed to get bot info: %s", err.Error())
 	}
 
-	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(cache, db, adminID))
+	commandHandler := &SquidCommandHandler{
+		db:    db,
+		cache: cache,
+		bot:   b,
+	}
+
+	commandHandler.Register("tags", handleListTags)
+	commandHandler.Register("mytags", handleListMyTags)
+	commandHandler.Register("stats", handleStats)
+	commandHandler.Register("submit", handleSubmit)
+	commandHandler.Register("tagsinfo", handleTagInfo)
+	commandHandler.Register("add", handleAddTag)
+	commandHandler.Register("bumptags", handleBumpTags)
+	commandHandler.Register("", handleGetSquid)
+
+	b.RegisterHandlerMatchFunc(matchCommand("squid", me.Username), makeHandleGetSquid(commandHandler))
 	b.RegisterHandlerMatchFunc(matchCommand("help", me.Username), func(c context.Context, b *bot.Bot, update *models.Update) {
 		sendText(c, b, update, `Commands:
 /squid - get a random squid image
@@ -92,6 +103,8 @@ func main() {
 /squid tags - list all tags
 /squid tagsinfo <tag> - get info about the specified tag
 /squid mytags - list your created tags
+/squid stats - show squid-bot statistics
+/squid submit - reply to an image to add it to the squid pool
 /squid add <tag> [tag...] - add the replied-to image to the specified tag(s)
 /squid bumptags <n> - (admin) reply to a user's message to raise their tag limit by n`)
 	})
@@ -116,39 +129,70 @@ func matchCommand(command, botUsername string) bot.MatchFunc {
 	}
 }
 
-func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB, adminID int64) bot.HandlerFunc {
+type CommandHandler interface {
+	Register(b *bot.Bot, me *models.User)
+	Execute(c context.Context, b *bot.Bot, update *models.Update) error
+}
+
+type CommandFunc func(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error
+
+type Command struct {
+	Name string
+	fn   CommandFunc
+}
+
+type SquidCommandHandler struct {
+	db       *sql.DB
+	cache    *lru.Cache[string, string]
+	bot      *bot.Bot
+	commands []Command
+}
+
+func (h *SquidCommandHandler) Register(commandName string, f CommandFunc) {
+	h.commands = append(h.commands, Command{Name: commandName, fn: f})
+}
+
+func (h *SquidCommandHandler) Execute(c context.Context, update *models.Update, args []string) error {
+	// If the first arg names a registered subcommand, route to it and strip
+	// the subcommand name from the args passed to the handler. Otherwise fall
+	// through to the "" handler with all args intact (bare /squid or /squid <tag>).
+	command := ""
+	cmdArgs := args
+	if len(args) > 0 {
+		for _, cmd := range h.commands {
+			if cmd.Name != "" && cmd.Name == args[0] {
+				command = args[0]
+				cmdArgs = args[1:]
+				break
+			}
+		}
+	}
+
+	for _, cmd := range h.commands {
+		if cmd.Name == command {
+			err := cmd.fn(c, h.bot, update, h.cache, h.db, cmdArgs...)
+			if err != nil {
+				log.Printf("Error executing command %s: %v", cmd.Name, err)
+				sendText(c, h.bot, update, "Something went wrong D:\n"+err.Error())
+			}
+
+			return err
+		}
+	}
+
+	return nil
+}
+
+func makeHandleGetSquid(commandHandler *SquidCommandHandler) bot.HandlerFunc {
 	return func(c context.Context, b *bot.Bot, update *models.Update) {
-		args := strings.Fields(update.Message.Text)[1:]
+		fields := strings.Fields(update.Message.Text)
+		args := []string{}
 
-		var sub string
-		if len(args) > 0 {
-			sub = args[0]
+		if len(fields) > 1 {
+			args = fields[1:]
 		}
 
-		var err error
-		switch {
-		case len(args) == 0:
-			// just get squid
-			err = handleGetSquid(c, b, update, cache, db)
-		case sub == "tags" && len(args) == 1:
-			// list all tags
-			err = handleListTags(c, b, update, db)
-		case sub == "mytags" && len(args) == 1:
-			// list tags created by user
-			err = handleListMyTags(c, b, update, db)
-		case sub == "tagsinfo" && len(args) == 2:
-			// get info about a tag
-			err = handleTagInfo(c, b, update, db, args[1])
-		case sub == "add" && len(args) >= 2:
-			// add the replied-to image to one or more tags
-			err = handleAddTag(c, b, update, db, args[1:]...)
-		case sub == "bumptags" && len(args) == 2:
-			// (admin) raise the replied-to user's tag creation limit
-			err = handleBumpTags(c, b, update, db, adminID, args[1])
-		default:
-			// get squid matching all given tags
-			err = handleGetSquidWithTag(c, b, update, db, args...)
-		}
+		err := commandHandler.Execute(c, update, args)
 
 		if err != nil {
 			sendText(c, b, update, "Something went wrong D:\n"+err.Error())
@@ -157,15 +201,147 @@ func makeHandleGetSquid(cache *lru.Cache[string, string], db *sql.DB, adminID in
 	}
 }
 
-func handleTagInfo(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tag string) error {
+func handleTagInfo(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
 	tagsQuery := "SELECT COUNT(*) FROM tag_images ti JOIN tags t ON ti.tag_id = t.id WHERE t.name = ?"
 	var count int
+	tag := args[0]
 	err := db.QueryRow(tagsQuery, tag).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("failed to query tag info: %s", err.Error())
 	}
 
 	sendText(c, b, update, fmt.Sprintf("tag %s has %d images", tag, count))
+	return nil
+}
+
+func handleStats(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
+	// number of image files available in the squid directory
+	var imageCount int
+	if entries, err := os.ReadDir("/app/squid"); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				imageCount++
+			}
+		}
+	}
+
+	var tagCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM tags").Scan(&tagCount); err != nil {
+		return fmt.Errorf("failed to count tags: %s", err.Error())
+	}
+
+	var taggedImages int
+	if err := db.QueryRow("SELECT COUNT(DISTINCT file_name) FROM tag_images").Scan(&taggedImages); err != nil {
+		return fmt.Errorf("failed to count tagged images: %s", err.Error())
+	}
+
+	// top tags by number of images
+	rows, err := db.Query(`SELECT t.name, COUNT(*) AS c
+		FROM tag_images ti JOIN tags t ON ti.tag_id = t.id
+		GROUP BY t.id
+		ORDER BY c DESC, t.name
+		LIMIT 5`)
+	if err != nil {
+		return fmt.Errorf("failed to query top tags: %s", err.Error())
+	}
+	defer rows.Close()
+
+	var topTags []string
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			return fmt.Errorf("failed to scan top tag: %s", err.Error())
+		}
+		topTags = append(topTags, fmt.Sprintf("%s (%d)", name, count))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read top tags: %s", err.Error())
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "squid-bot stats:\n")
+	fmt.Fprintf(&sb, "images: %d\n", imageCount)
+	fmt.Fprintf(&sb, "tags: %d\n", tagCount)
+	fmt.Fprintf(&sb, "tagged images: %d\n", taggedImages)
+
+	if len(topTags) > 0 {
+		fmt.Fprintf(&sb, "top tags: %s\n", strings.Join(topTags, ", "))
+	}
+
+	if update.Message.From != nil {
+		var myTags int
+		if err := db.QueryRow("SELECT COUNT(*) FROM tags WHERE created_by = ?", update.Message.From.ID).Scan(&myTags); err != nil {
+			return fmt.Errorf("failed to count your tags: %s", err.Error())
+		}
+		fmt.Fprintf(&sb, "your tags: %d", myTags)
+	}
+
+	sendText(c, b, update, strings.TrimRight(sb.String(), "\n"))
+	return nil
+}
+
+func handleSubmit(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
+	adminID := os.Getenv("ADMIN_ID")
+	if update.Message.From == nil || adminID == "" || strconv.FormatInt(update.Message.From.ID, 10) != adminID {
+		sendText(c, b, update, "only @surgethewolf can use this command")
+		return nil
+	}
+
+	reply := update.Message.ReplyToMessage
+	if reply == nil {
+		sendText(c, b, update, "reply to an image to submit it to the squid pool")
+		return nil
+	}
+
+	fileID := replyImageFileID(reply)
+	if fileID == "" {
+		sendText(c, b, update, "the replied-to message does not contain an image")
+		return nil
+	}
+
+	// resolve the file path on Telegram's servers
+	file, err := b.GetFile(c, &bot.GetFileParams{FileID: fileID})
+	if err != nil {
+		return fmt.Errorf("failed to get file: %s", err.Error())
+	}
+
+	// name the saved file after its unique id so re-submissions are idempotent
+	ext := filepath.Ext(file.FilePath)
+	if ext == "" {
+		ext = ".jpg"
+	}
+	dest := filepath.Join("/app/squid", file.FileUniqueID+ext)
+
+	if _, err := os.Stat(dest); err == nil {
+		sendText(c, b, update, "this image is already in the squid pool")
+		return nil
+	}
+
+	link := b.FileDownloadLink(file)
+	req, err := http.NewRequestWithContext(c, http.MethodGet, link, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build download request: %s", err.Error())
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %s", err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download file: unexpected status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read downloaded file: %s", err.Error())
+	}
+
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return fmt.Errorf("failed to save image: %s", err.Error())
+	}
+
+	sendText(c, b, update, "thanks! added your image to the squid pool")
 	return nil
 }
 
@@ -271,7 +447,7 @@ func tagsCaption(db *sql.DB, fileName string) (string, error) {
 	return strings.Join(tags, ", "), nil
 }
 
-func handleListTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB) error {
+func handleListTags(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
 	// if replying to a squid-bot image, list that image's tags instead of all tags
 	if reply := update.Message.ReplyToMessage; reply != nil && sentBySquidBot(reply, b.ID()) {
 		fileName := replyImageFileID(reply)
@@ -305,7 +481,7 @@ func handleListTags(c context.Context, b *bot.Bot, update *models.Update, db *sq
 	return nil
 }
 
-func handleListMyTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB) error {
+func handleListMyTags(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
 	if update.Message.From == nil {
 		return errors.New("mytags: message has no sender")
 	}
@@ -365,8 +541,9 @@ func tagLimit(q rowQuerier, userID int64) (int, error) {
 	return limit, nil
 }
 
-func handleBumpTags(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, adminID int64, amountArg string) error {
-	if update.Message.From == nil || adminID == 0 || update.Message.From.ID != adminID {
+func handleBumpTags(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
+	adminID := os.Getenv("ADMIN_ID")
+	if update.Message.From == nil || adminID == "" || strconv.FormatInt(update.Message.From.ID, 10) != adminID {
 		sendText(c, b, update, "only @surgethewolf can use this command")
 		return nil
 	}
@@ -381,7 +558,11 @@ func handleBumpTags(c context.Context, b *bot.Bot, update *models.Update, db *sq
 	}
 	targetID := update.Message.ReplyToMessage.From.ID
 
-	amount, err := strconv.Atoi(amountArg)
+	if len(args) == 0 {
+		sendText(c, b, update, "amount must be specified")
+		return nil
+	}
+	amount, err := strconv.Atoi(args[0])
 	if err != nil || amount <= 0 {
 		sendText(c, b, update, "amount must be a positive integer")
 		return nil
@@ -419,7 +600,7 @@ func replyToSenderName(msg *models.Message) string {
 	return name
 }
 
-func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, db *sql.DB, tags ...string) error {
+func handleAddTag(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, tags ...string) error {
 	if update.Message.ReplyToMessage == nil {
 		sendText(c, b, update, "reply to an image to add a tag")
 		return nil
@@ -574,7 +755,13 @@ func replyImageFileID(msg *models.Message) string {
 	return ""
 }
 
-func handleGetSquid(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB) error {
+func handleGetSquid(c context.Context, b *bot.Bot, update *models.Update, cache *lru.Cache[string, string], db *sql.DB, args ...string) error {
+	// /squid <tag> [tag...] -> a random image having all the specified tags
+	if len(args) > 0 {
+		return handleGetSquidWithTag(c, b, update, db, args...)
+	}
+
+	// bare /squid -> a random image
 	file, err := getRandomFile(cache, "/app/squid")
 	if err != nil {
 		return err
