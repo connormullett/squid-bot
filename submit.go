@@ -75,6 +75,6 @@ func handleSubmit(c context.Context, b *bot.Bot, update *models.Update, cache *l
 		return fmt.Errorf("failed to save image: %s", err.Error())
 	}
 
-	sendText(c, b, update, "thanks! added your image to the squid pool")
+	sendText(c, b, update, "added image")
 	return nil
 }
