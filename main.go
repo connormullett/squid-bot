@@ -72,8 +72,15 @@ func main() {
 /squid stats - show squid-bot statistics
 /squid submit - reply to an image to add it to the squid pool
 /squid add <tag> [tag...] - add the replied-to image to the specified tag(s)
-/squid bumptags <n> - (admin) reply to a user's message to raise their tag limit by n`)
+/squid bumptags <n> - (admin) reply to a user's message to raise their tag limit by n
+@`+me.Username+` <question> - ask me anything; reply to my answer to keep chatting`)
 	})
+
+	// LLM chat: registered after the command handlers so /squid ... still wins.
+	// Fires when the bot is @mentioned or when a user replies to one of its
+	// messages, answering via a local Ollama model.
+	convs := newConvStore()
+	b.RegisterHandlerMatchFunc(matchMention(me.ID, me.Username), makeHandleMention(convs, me.ID, me.Username))
 
 	log.Println("starting bot")
 	b.Start(ctx)
