@@ -77,11 +77,13 @@ func main() {
 	})
 
 	// LLM chat: registered after the command handlers so /squid ... still wins.
-	// Fires when the bot is @mentioned or when a user replies to one of its
-	// messages, answering via a local Ollama model.
-	convs := newConvStore()
-	b.RegisterHandlerMatchFunc(matchMention(me.ID, me.Username), makeHandleMention(convs, me.ID, me.Username))
+	// Fires when the bot is @mentioned or when a user replies to one of its messages
+	if os.Getenv("ALLOW_LLM_MODE") == "true" {
+		convs := newConvStore()
+		b.RegisterHandlerMatchFunc(matchMention(me.ID, me.Username), makeHandleMention(convs, me.ID, me.Username))
+	}
 
+	log.Println("LLM mode:", os.Getenv("ALLOW_LLM_MODE") == "true")
 	log.Println("starting bot")
 	b.Start(ctx)
 }
