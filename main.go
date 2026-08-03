@@ -131,24 +131,27 @@ func getRandomFile(cache *lru.Cache[string, string], dirPath string) (string, er
 	var files []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
-			files = append(files, entry.Name())
+			files = append(files, filepath.Join(dirPath, entry.Name()))
 		}
 	}
-
-	for {
-		if len(files) == 0 {
-			return "", nil
-		}
-
-		randomIndex := rand.Intn(len(files))
-		randomFileName := files[randomIndex]
-
-		path := filepath.Join(dirPath, randomFileName)
-
-		if cache.Contains(path) {
-			continue
-		}
-		cache.Add(path, path)
-		return path, nil
+	if len(files) == 0 {
+		return "", nil
 	}
+
+	// Prefer a file we haven't served recently. When every file is already
+	// cached — which is always the case for a directory smaller than the
+	// cache — fall back to the full set rather than spinning forever.
+	candidates := make([]string, 0, len(files))
+	for _, path := range files {
+		if !cache.Contains(path) {
+			candidates = append(candidates, path)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = files
+	}
+
+	path := candidates[rand.Intn(len(candidates))]
+	cache.Add(path, path)
+	return path, nil
 }
